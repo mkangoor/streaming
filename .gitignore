@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local tooling
+.venv/
+.ruff_cache/
+.pytest_cache/
+reports/
+.databricks/
+spark-warehouse/
+metastore_db/
+derby.log

@@ -1,0 +1,178 @@
+# All job tasks run the `tax-rag` CLI from this repo's wheel on serverless compute.
+resources:
+  jobs:
+    # Silver document versions -> gold chunks -> vector index.
+    # dev/staging: run on demand / by CD (available-now). prod: continuous stream.
+    tax_rag_chunk_sync:
+      name: tax-rag-chunk-sync-${bundle.target}
+      description: Keeps gold_tax_document_chunks and the vector index in sync with silver.
+      max_concurrent_runs: 1 # single writer to the gold table, by design
+      tags:
+        component: retrieval
+        git_sha: ${var.git_sha}
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "3"
+            dependencies:
+              - ../dist/*.whl
+      tasks:
+        - task_key: sync_chunks
+          environment_key: default
+          max_retries: 2
+          min_retry_interval_millis: 60000
+          python_wheel_task:
+            package_name: tax_rag
+            entry_point: tax-rag
+            parameters:
+              - sync-chunks
+              - --catalog=${var.catalog}
+              - --schema=${resources.schemas.tax_rag.name}
+              - --trigger=${var.chunk_sync_trigger}
+              - --vector-search-endpoint=${var.vector_search_endpoint}
+              - --embedding-endpoint=${var.embedding_endpoint}
+              - --index-pipeline-type=${var.index_pipeline_type}
+              - --checkpoint-root=/Volumes/${var.catalog}/${resources.schemas.tax_rag.name}/${resources.volumes.checkpoints.name}
+
+    # Governance + agent release: register -> evaluate (quality gate) -> deploy.
+    tax_rag_release:
+      name: tax-rag-release-${bundle.target}
+      description: Applies UC docs/tags, then registers, evaluates and (if the gate passes) deploys the agent.
+      max_concurrent_runs: 1
+      tags:
+        component: agent
+        git_sha: ${var.git_sha}
+      environments:
+        - environment_key: rag
+          spec:
+            environment_version: "3"
+            dependencies:
+              - ../dist/*.whl
+              - mlflow[databricks]>=3.1
+              - databricks-agents>=1.0
+      tasks:
+        - task_key: apply_governance
+          environment_key: rag
+          python_wheel_task:
+            package_name: tax_rag
+            entry_point: tax-rag
+            parameters:
+              - apply-governance
+              - --catalog=${var.catalog}
+              - --schema=${resources.schemas.tax_rag.name}
+
+        - task_key: register_agent
+          environment_key: rag
+          python_wheel_task:
+            package_name: tax_rag
+            entry_point: tax-rag
+            parameters:
+              - register-agent
+              - --catalog=${var.catalog}
+              - --schema=${resources.schemas.tax_rag.name}
+              - --experiment=${resources.experiments.tax_rag_agent.name}
+              - --llm-endpoint=${var.llm_endpoint}
+              - --embedding-endpoint=${var.embedding_endpoint}
+              - --git-sha=${var.git_sha}
+
+        - task_key: evaluate_agent
+          depends_on:
+            - task_key: register_agent
+          environment_key: rag
+          python_wheel_task:
+            package_name: tax_rag
+            entry_point: tax-rag
+            parameters:
+              - evaluate-agent
+              - --catalog=${var.catalog}
+              - --schema=${resources.schemas.tax_rag.name}
+              - --model-version={{tasks.register_agent.values.model_version}}
+              - --experiment=${resources.experiments.tax_rag_agent.name}
+              - --eval-set=${workspace.file_path}/${var.eval_set_file}
+
+        - task_key: deploy_agent
+          depends_on:
+            - task_key: evaluate_agent
+          environment_key: rag
+          python_wheel_task:
+            package_name: tax_rag
+            entry_point: tax-rag
+            parameters:
+              - deploy-agent
+              - --catalog=${var.catalog}
+              - --schema=${resources.schemas.tax_rag.name}
+              - --model-version={{tasks.register_agent.values.model_version}}
+              - --endpoint-name=${var.agent_endpoint_name}
+              - --scale-to-zero=${var.agent_scale_to_zero}
+              - --git-sha=${var.git_sha}
+
+    # Re-point the endpoint at a previous (already gated) model version.
+    #   databricks bundle run -t prod tax_rag_rollback --params model_version=7
+    tax_rag_rollback:
+      name: tax-rag-rollback-${bundle.target}
+      max_concurrent_runs: 1
+      parameters:
+        - name: model_version
+          default: ""
+      environments:
+        - environment_key: rag
+          spec:
+            environment_version: "3"
+            dependencies:
+              - ../dist/*.whl
+              - mlflow[databricks]>=3.1
+              - databricks-agents>=1.0
+      tasks:
+        - task_key: deploy_agent
+          environment_key: rag
+          python_wheel_task:
+            package_name: tax_rag
+            entry_point: tax-rag
+            parameters:
+              - deploy-agent
+              - --catalog=${var.catalog}
+              - --schema=${resources.schemas.tax_rag.name}
+              - --model-version={{job.parameters.model_version}}
+              - --endpoint-name=${var.agent_endpoint_name}
+              - --scale-to-zero=${var.agent_scale_to_zero}
+              - --git-sha=rollback
+
+    # Post-deploy verification (run by CD) and a daily health check in prod.
+    tax_rag_verify:
+      name: tax-rag-verify-${bundle.target}
+      description: Data health across bronze/silver/gold/index, then a live call to the agent endpoint.
+      max_concurrent_runs: 1
+      tags:
+        component: verification
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "3"
+            dependencies:
+              - ../dist/*.whl
+      tasks:
+        - task_key: verify_data
+          environment_key: default
+          python_wheel_task:
+            package_name: tax_rag
+            entry_point: tax-rag
+            parameters:
+              - verify-data
+              - --catalog=${var.catalog}
+              - --schema=${resources.schemas.tax_rag.name}
+              - --max-quarantine-ratio=${var.max_quarantine_ratio}
+              - --max-staleness-hours=${var.max_staleness_hours}
+        - task_key: smoke_test_agent
+          depends_on:
+            - task_key: verify_data
+          environment_key: default
+          python_wheel_task:
+            package_name: tax_rag
+            entry_point: tax-rag
+            parameters:
+              - smoke-test
+              - --catalog=${var.catalog}
+              - --schema=${resources.schemas.tax_rag.name}
+              - --endpoint-name=${var.agent_endpoint_name}
+              - --question=${var.smoke_question}
+              - --require-citations=${var.smoke_require_citations}

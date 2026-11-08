@@ -1,0 +1,27 @@
+resources:
+  pipelines:
+    tax_ingest:
+      name: tax-ingest-${bundle.target}
+      catalog: ${var.catalog}
+      schema: ${resources.schemas.tax_rag.name}
+      serverless: true
+      channel: CURRENT
+      # Triggered in dev/staging (cheap, deterministic); prod overrides to continuous.
+      continuous: false
+      libraries:
+        - file:
+            path: ../src/pipelines/tax_ingest.py
+      environment:
+        dependencies:
+          # Installs this repo's package (synced by the bundle) on every pipeline node.
+          - --editable ${workspace.file_path}
+      configuration:
+        tax_rag.source_mode: ${var.source_mode}
+        tax_rag.api_base_url: ${var.api_base_url}
+        tax_rag.secret_scope: ${var.secret_scope}
+        tax_rag.api_token_key: ${var.api_token_key}
+        tax_rag.start_from: ${var.start_from}
+        tax_rag.landing_path: /Volumes/${var.catalog}/${resources.schemas.tax_rag.name}/${resources.volumes.landing.name}/incoming
+        tax_rag.kafka_bootstrap_servers: ${var.kafka_bootstrap_servers}
+        tax_rag.kafka_topic: ${var.kafka_topic}
+        tax_rag.kafka_jaas_secret_key: ${var.kafka_jaas_secret_key}

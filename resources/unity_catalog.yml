@@ -1,0 +1,34 @@
+# Unity Catalog objects owned by the bundle. Catalogs are created once by
+# scripts/bootstrap/uc_bootstrap.sql (needs metastore-admin rights the deploy SP shouldn't have).
+resources:
+  schemas:
+    tax_rag:
+      catalog_name: ${var.catalog}
+      name: ${var.schema}
+      comment: >-
+        Tax documents: streaming bronze/silver tables (Lakeflow), RAG chunks (gold),
+        vector index and the tax_rag_agent model. Docs: docs/data_dictionary.md.
+      properties:
+        domain: tax
+        owner_team: tax-data-platform
+      grants:
+        - principal: ${var.reader_group}
+          privileges: [USE_SCHEMA, SELECT, EXECUTE]
+
+  volumes:
+    landing:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.tax_rag.name}
+      name: landing
+      volume_type: MANAGED
+      comment: JSON-lines drops (vendor exports / test fixtures) read by Auto Loader in `files` mode.
+    checkpoints:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.tax_rag.name}
+      name: checkpoints
+      volume_type: MANAGED
+      comment: Structured Streaming checkpoints for jobs outside the Lakeflow pipeline.
+
+  experiments:
+    tax_rag_agent:
+      name: ${workspace.root_path}/experiments/tax_rag_agent
