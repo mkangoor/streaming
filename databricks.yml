@@ -1,0 +1,167 @@
+# Databricks Asset Bundle: streaming tax-document ingestion + RAG agent.
+#
+#   databricks bundle validate -t dev
+#   databricks bundle deploy   -t dev
+#   databricks bundle run      -t dev tax_ingest
+#
+# Workspace hosts are NOT pinned here: CI injects DATABRICKS_HOST per GitHub Environment,
+# locally use `databricks auth login --host ...` or DATABRICKS_CONFIG_PROFILE.
+# If dev/staging/prod live in different workspaces, pin `workspace.host` per target below.
+bundle:
+  name: tax_rag
+  databricks_cli_version: ">= 0.270.0"
+
+include:
+  - resources/*.yml
+
+artifacts:
+  tax_rag_wheel:
+    type: whl
+    build: uv build --wheel
+    path: .
+    # Unique version per deploy so serverless never reuses a cached older wheel.
+    dynamic_version: true
+
+sync:
+  exclude:
+    - .venv
+    - "**/__pycache__"
+    - reports
+
+variables:
+  catalog:
+    description: Unity Catalog catalog for this environment (created by scripts/bootstrap).
+  schema:
+    description: Schema holding tables, volumes, the agent model and the vector index.
+    default: tax_rag
+  service_principal:
+    description: Application ID of the service principal that staging/prod run as (CI sets BUNDLE_VAR_service_principal).
+    default: ""
+  git_sha:
+    description: Commit being deployed; stamped on models and endpoints for traceability.
+    default: local
+  reader_group:
+    description: Group granted read access on the schema.
+    default: account users
+
+  # ---- ingestion
+  source_mode:
+    description: "Ingestion path: api (poll REST API), files (Auto Loader on landing volume), kafka."
+    default: api
+  api_base_url:
+    description: Base URL of the upstream tax-document API.
+    default: https://api.tax-provider.example.com
+  secret_scope:
+    description: Secret scope holding the API token (and Kafka JAAS config if used).
+    default: tax-rag
+  api_token_key:
+    default: tax-api-token
+  start_from:
+    description: Earliest updated_at to backfill on the first run of the API source.
+    default: "2024-01-01T00:00:00Z"
+  kafka_bootstrap_servers:
+    default: ""
+  kafka_topic:
+    default: tax-documents
+  kafka_jaas_secret_key:
+    description: Secret key holding a sasl.jaas.config (e.g. Event Hubs); empty = no SASL.
+    default: ""
+
+  # ---- retrieval + generation
+  llm_endpoint:
+    description: Model Serving / Foundation Model API chat endpoint used for answers.
+    default: databricks-claude-sonnet-4-5
+  embedding_endpoint:
+    default: databricks-gte-large-en
+  vector_search_endpoint:
+    default: tax-rag-vs
+  index_pipeline_type:
+    description: TRIGGERED (sync after each chunk-sync run) or CONTINUOUS (streams CDF).
+    default: TRIGGERED
+  chunk_sync_trigger:
+    description: available-now (batch catch-up) or continuous (long-running stream).
+    default: available-now
+  agent_endpoint_name:
+    description: Serving endpoint name for the deployed agent.
+  agent_scale_to_zero:
+    default: "true"
+
+  # ---- verification
+  eval_set_file:
+    description: Eval set (relative to the bundle root) gating every release.
+    default: evals/fixture_eval_set.jsonl
+  max_quarantine_ratio:
+    default: "0.02"
+  max_staleness_hours:
+    description: Fail verification if the newest document is older than this; 0 disables.
+    default: "0"
+  smoke_question:
+    default: What is the standard VAT rate in Zedland?
+  smoke_require_citations:
+    default: "true"
+
+permissions:
+  - level: CAN_VIEW
+    group_name: users
+
+targets:
+  dev:
+    # Per-developer isolation: resources are prefixed with [dev <user>], schedules paused,
+    # pipelines run in development mode, UC schema becomes dev_<user>_tax_rag.
+    mode: development
+    default: true
+    variables:
+      catalog: tax_dev
+      source_mode: files
+      vector_search_endpoint: tax-rag-vs-dev
+      agent_endpoint_name: tax-rag-agent-dev-${workspace.current_user.short_name}
+      max_quarantine_ratio: "0.15" # fixtures contain one deliberately malformed record
+
+  staging:
+    # Deterministic end-to-end verification on the fixture corpus. Switch source_mode to
+    # `api` + api_base_url to the vendor sandbox once one exists.
+    mode: production
+    workspace:
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    run_as:
+      service_principal_name: ${var.service_principal}
+    variables:
+      catalog: tax_staging
+      source_mode: files
+      vector_search_endpoint: tax-rag-vs-staging
+      agent_endpoint_name: tax-rag-agent-staging
+      max_quarantine_ratio: "0.15"
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    run_as:
+      service_principal_name: ${var.service_principal}
+    variables:
+      catalog: tax_prod
+      source_mode: api
+      vector_search_endpoint: tax-rag-vs-prod
+      index_pipeline_type: CONTINUOUS
+      chunk_sync_trigger: continuous
+      agent_endpoint_name: tax-rag-agent-prod
+      agent_scale_to_zero: "false"
+      # Must be curated from real questions over the real corpus; release fails without it.
+      eval_set_file: evals/prod_eval_set.jsonl
+      max_staleness_hours: "24"
+      reader_group: tax-rag-consumers
+      smoke_question: What sources do you have on VAT registration thresholds?
+      smoke_require_citations: "false"
+    resources:
+      pipelines:
+        tax_ingest:
+          continuous: true
+      jobs:
+        tax_rag_chunk_sync:
+          continuous:
+            pause_status: UNPAUSED
+        tax_rag_verify:
+          schedule:
+            quartz_cron_expression: "0 17 6 * * ?"
+            timezone_id: UTC
+            pause_status: UNPAUSED

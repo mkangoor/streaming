@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tax_rag"
+version = "0.1.0"
+description = "Streaming tax-document ingestion into Unity Catalog and a RAG agent on Databricks."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+# Runtime deps for the pipeline + jobs. Databricks runtimes already ship pyspark,
+# databricks-sdk and mlflow; they are declared in the extras below for local work.
+dependencies = [
+  "requests>=2.31",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+rag = [
+  "mlflow[databricks]>=3.1",
+  "databricks-agents>=1.0",
+  "databricks-sdk>=0.50",
+]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "ruff>=0.6",
+  "pyspark==4.0.1",
+  "pyarrow>=15",
+  "pandas>=2.0",
+  "databricks-sdk>=0.50",
+]
+
+[project.scripts]
+tax-rag = "tax_rag.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tax_rag"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+markers = ["spark: needs a local SparkSession (Java 17+)"]
+addopts = "-ra"
+
+[tool.coverage.run]
+source = ["tax_rag"]
+omit = ["src/tax_rag/rag/agent.py", "src/tax_rag/release/*", "src/tax_rag/cli.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["RUF012", "E501"]  # formatter owns line length
+
+[tool.ruff.lint.per-file-ignores]
+# Lakeflow pipeline source: `spark` / `dbutils` are injected globals.
+"src/pipelines/*.py" = ["F821"]
